@@ -1,10 +1,12 @@
 #Library and loading----
-library(ggplot2)
 library(glmnet)
 library(glmnetUtils)
-library(tidyverse)
 library(pROC)
 library(rsample)
+library(ModelMetrics)
+library(ggplot2)
+library(tidyverse)
+
 
 set.seed(438)
 
@@ -17,59 +19,105 @@ df <- df |>
          charge_degree = as.factor(charge_degree),
          charge_id = as.factor(charge_id))
 
-# mturk <- read_csv("data/MTURK_CHARGE_DESC.csv",
-#                   na = "NA") |>
-#   select(-c(3:25)) |>
-#   filter(!is.na(charge_id)) #MTURK variables chosen
-# 
-# df_subset <- df |>
-#   filter(charge_id %in% mturk$charge_id) #using charges from paper
-
-#train test split----
-splitobj <- initial_split(df, prop = 4/5) #initial object, 80/20 split
-train <- training(splitobj)
-test <- testing(splitobj)
+#not getting rid of other races because we need to consider overall accuracy
 
 #TOP 1: The Paper's Linear Models----
 #1: 7-predictor logistic algorithm assessment (uses full dataset)
-train_sub <- train |>
-  select(two_year_recid, age, sex, priors_count, juv_fel_count, juv_misd_count, charge_degree, charge_id) #fixes contrasts error
+#initialize vars
+accuracy <- NULL #overall accuracy
+acc_white <- NULL #accuracy white
+acc_black <- NULL #accuracy black
+fp_black <- NULL #false positive black
+fp_white <- NULL #false positive white
+fn_black <- NULL #false negative black
+fn_white <- NULL #false negative white
 
-#sev_pred <- glm(two_year_recid ~ age + sex + priors_count
-#    + juv_fel_count + juv_misd_count + charge_degree + charge_id,
-#    data = train_sub, family = "binomial")
-
-sev_pred <- glm(two_year_recid ~.-charge_id, data=train_sub, family="binomial") #fixing error w rank deficiency
-sev_pred$xlevels[["charge_id"]] <- union(sev_pred$xlevels[["charge_id"]], levels(test$charge_id))
-
-y_hat <- predict(sev_pred, newdata=test, type="response")
-y_hat <- as.numeric(y_hat > 0.5)
-mean(y_hat == df$two_year_recid[df$id %in% test$id]) #accuracy
-
-roc(df$two_year_recid[df$id %in% train$id] ~ sev_pred$fitted.values, plot = TRUE, print.auc = TRUE)
+for (i in 1:1000) {
+  #random split
+  splitobj <- initial_split(df, prop = 4/5) #initial object, 80/20 split
+  train <- training(splitobj)
+  test <- testing(splitobj)
+  
+  #train model
+  sev_pred <- glm(two_year_recid ~ age + sex + priors_count + juv_fel_count +
+                    juv_misd_count + charge_degree + charge_id, data=train, family="binomial")
+  
+  #make prediction
+  test$charge_id[which(!(test$charge_id %in% unique(train$charge_id)))] <- NA #editing test data
+  #fixes error with new levels...cant predict for these, so just ignore?
+  
+  y_hat <- predict(sev_pred, newdata=test, type="response")
+  y_hat <- as.numeric(y_hat > 0.5) #binary predictions
+  
+  #get ids in this test batch
+  y <- df[which(df$id %in% test$id),] |>
+    select(race, two_year_recid) |> #add race variables so i can filter by this condition
+    rename(y_act = two_year_recid)
+  
+  #combine obs
+  y$y_hat <- y_hat
+  y <- na.omit(y, cols="y_hat")#get rid of NA rows...
+  
+  #store relevant values
+  accuracy[i] <- mean(y$y_act == y$y_hat) #overall accuracy for this round
+  acc_black[i] <- mean(y$y_act[y$race == 2] == y$y_hat[y$race == 2])
+  acc_white[i] <- mean(y$y_act[y$race == 1] == y$y_hat[y$race == 1])
+  
+  #Confusion Matrix Black and white
+  cm_black <- confusionMatrix(y$y_act[(y$race == 2)], y$y_hat[(y$race == 2)])
+  cm_white <- confusionMatrix(y$y_act[(y$race == 1)], y$y_hat[(y$race == 1)])
+  
+  #False Pos and False Neg
+  fn_black[i] <- cm_black[2,1]/sum(cm_black[2,]) #2nd row is "actually true" row
+  fn_white[i] <- cm_white[2,1]/sum(cm_white[2,])
+  fp_black[i] <- cm_black[1,2]/sum(cm_black[1,]) #1st row is "actually false" row
+  fp_white[i] <- cm_white[1,2]/sum(cm_white[1,])
+  
+}
 
 #2: 2-predictor logistic algorithm assessment (uses full dataset)
-two_pred <- glm(two_year_recid ~ age + priors_count, data=train, family="binomial") #fixing error w rank deficiency
-
-y_hat <- predict(two_pred, newdata=test, type="response")
-y_hat <- as.numeric(y_hat > 0.5)
-mean(y_hat == df$two_year_recid[df$id %in% test$id]) #accuracy
-
-roc(df$two_year_recid[df$id %in% train$id] ~ two_pred$fitted.values, plot = TRUE, print.auc = TRUE)
 #bootstrap standard errors
 
-#3: My 7-predictor model (different aggregation)
-train_sub <- train |>
-  select(two_year_recid, age, sex, priors_count, juv_fel_count, juv_misd_count, charge_degree, aggregated) #fixes contrasts error
-
-my_sev <- glm(two_year_recid ~.-aggregated, data=train_sub, family="binomial") #fixing error w rank deficiency
-my_sev$xlevels[["aggregated"]] <- union(my_sev$xlevels[["aggregated"]], levels(test$aggregated))
-
-y_hat <- predict(my_sev, newdata=test, type="response")
-y_hat <- as.numeric(y_hat > 0.5)
-mean(y_hat == df$two_year_recid[df$id %in% test$id]) #accuracy
-
-roc(df$two_year_recid[df$id %in% train$id] ~ my_sev$fitted.values, plot = TRUE, print.auc = TRUE)
+for (i in 1:1000) { #bootstrapped = need to resample?
+  #random split
+  splitobj <- initial_split(df, prop = 4/5) #initial object, 80/20 split
+  train <- training(splitobj)
+  test <- testing(splitobj)
+  
+  #train <- sample_n(df, size = floor(0.8*dim(df)[1]), replace = TRUE) #bootstrap
+  #test <- sample_n(df, size = floor(0.2*dim(df)[1]), replace = TRUE) #bootstrap
+  
+  #train model
+  two_pred <- glm(two_year_recid ~ age + priors_count, data=train, family="binomial")
+  
+  #make prediction
+  y_hat <- predict(two_pred, newdata=test, type="response") #needs to include race info
+  y_hat <- as.numeric(y_hat > 0.5) #binary predictions
+  
+  #get ids in this test batch
+  y <- df[which(df$id %in% test$id),] |>
+    #to use bootstrap version, need to change from which to get duplicates
+    select(race, two_year_recid) |> #add race variables so i can filter by this condition
+    rename(y_act = two_year_recid)
+  
+  #combine obs
+  y$y_hat <- y_hat
+  
+  #store relevant values
+  accuracy[i] <- mean(y$y_act == y$y_hat) #overall accuracy for this round
+  acc_black[i] <- mean(y$y_act[y$race == 2] == y$y_hat[y$race == 2])
+  acc_white[i] <- mean(y$y_act[y$race == 1] == y$y_hat[y$race == 1])
+  #Confusion Matrix Black and white
+  cm_black <- confusionMatrix(y$y_act[(y$race == 2)], y$y_hat[(y$race == 2)])
+  cm_white <- confusionMatrix(y$y_act[(y$race == 1)], y$y_hat[(y$race == 1)])
+  
+  #False Pos and False Neg
+  fn_black[i] <- cm_black[2,1]/sum(cm_black[2,]) #2nd row is "actually true" row
+  fn_white[i] <- cm_white[2,1]/sum(cm_white[2,])
+  fp_black[i] <- cm_black[1,2]/sum(cm_black[1,]) #1st row is "actually false" row
+  fp_white[i] <- cm_white[1,2]/sum(cm_white[1,])
+  
+}
 
 #TOP 2: Given race, white people have a negative correlation with decile score, while Black people have a uniform one----
 dec_white <- df |>
